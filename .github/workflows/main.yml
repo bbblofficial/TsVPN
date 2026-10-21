@@ -1,4 +1,4 @@
-name: Deploy 3x-ui via Tailscale (Auth Key)
+name: Run 3x-ui Panel (GitHub Runner as Server)
 
 on:
   workflow_dispatch:
@@ -8,66 +8,107 @@ on:
         required: true
         type: string
 
+      xui_username:
+        description: '3x-ui admin username'
+        required: true
+        default: 'admin'
+        type: string
+
+      xui_password:
+        description: '3x-ui admin password'
+        required: true
+        type: string
+
+      xui_panel_port:
+        description: '3x-ui panel port'
+        required: true
+        default: '2053'
+        type: string
+
+      xui_web_base_path:
+        description: '3x-ui web base path (leave empty to auto-generate)'
+        required: false
+        default: ''
+        type: string
+
+      keep_alive_minutes:
+        description: 'How many minutes to keep the runner (server) alive'
+        required: true
+        default: '30'
+        type: string
+
 jobs:
-  deploy:
+  server:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # حداکثر ۶ ساعت
 
     steps:
-      - name: Checkout repository
+      # 0) (اختیاری) چک‌اوت — برای اجرای این وورکفلو لازم نیست ولی بی‌ضرره
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 1. اتصال به Tailscale با استفاده از Auth Key ورودی
-      # ------------------------------------------------------------
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+      # 1) نصب Tailscale و اتصال به Tailnet روی خود Runner
+      - name: Install & Connect Tailscale
+        uses: tailscale/github-action@v3
         with:
-          authkey: ${{ github.event.inputs.tailscale_auth_key }}
+          authkey: ${{ inputs.tailscale_auth_key }}
+          tags: tag:ci
 
-      # ------------------------------------------------------------
-      # 2. آماده‌سازی SSH برای اتصال به سرور از طریق Tailscale
-      # ------------------------------------------------------------
-      - name: Setup SSH
+      - name: Show Tailscale IP
+        run: echo "Tailscale IP = $(tailscale ip -4)"
+
+      # 2) نصب 3x-ui روی خود Runner (نیاز به sudo)
+      - name: Install 3x-ui on the runner
+        env:
+          XUI_USERNAME: ${{ inputs.xui_username }}
+          XUI_PASSWORD: ${{ inputs.xui_password }}
+          XUI_PANEL_PORT: ${{ inputs.xui_panel_port }}
+          XUI_WEB_BASE_PATH_IN: ${{ inputs.xui_web_base_path }}
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.SERVER_TAILSCALE_HOST }} >> ~/.ssh/known_hosts
+          BASEPATH="${XUI_WEB_BASE_PATH_IN}"
+          if [ -z "$BASEPATH" ]; then
+            BASEPATH=$(openssl rand -hex 8)
+          fi
 
-      # ------------------------------------------------------------
-      # 3. نصب 3x-ui در حالت غیرتعاملی
-      # ------------------------------------------------------------
-      - name: Install 3x-ui on Ubuntu
+          sudo XUI_NONINTERACTIVE=1 \
+               XUI_USERNAME="$XUI_USERNAME" \
+               XUI_PASSWORD="$XUI_PASSWORD" \
+               XUI_PANEL_PORT="$XUI_PANEL_PORT" \
+               XUI_WEB_BASE_PATH="$BASEPATH" \
+               bash -c "$(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
+
+          # ذخیره base path برای گام بعدی
+          echo "BASEPATH=$BASEPATH" >> "$GITHUB_ENV"
+
+      # 3) چاپ لینک پنل روی Tailscale IP خود Runner
+      - name: Print VPN Panel URL
         run: |
-          ssh root@${{ secrets.SERVER_TAILSCALE_HOST }} << 'EOF'
-            export XUI_NONINTERACTIVE=1
-            export XUI_USERNAME=admin
-            export XUI_PASSWORD=ChangeMe123!
-            export XUI_PANEL_PORT=2053
-            export XUI_WEB_BASE_PATH=$(openssl rand -hex 8)
+          TSIP=$(tailscale ip -4)
+          URL="http://${TSIP}:${{ inputs.xui_panel_port }}/${BASEPATH}"
 
-            bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-          EOF
+          echo "============================================="
+          echo "   3x-ui VPN Panel is UP"
+          echo "============================================="
+          echo "Panel URL  : $URL"
+          echo "Username   : ${{ inputs.xui_username }}"
+          echo "Password   : ${{ inputs.xui_password }}"
+          echo "Tailscale  : $TSIP"
+          echo "Expires in : ${{ inputs.keep_alive_minutes }} minutes"
+          echo "============================================="
 
-      # ------------------------------------------------------------
-      # 4. چاپ اطلاعات دسترسی به پنل VPN
-      # ------------------------------------------------------------
-      - name: Print panel URL & credentials
+          # مخفی‌سازی رمز در لاگ‌های بعدی
+          echo "::add-mask::${{ inputs.xui_password }}"
+
+          # نمایش وضعیت سرویس
+          sudo systemctl status x-ui --no-pager | head -8 || true
+
+      # 4) زنده نگه‌داشتن Runner تا پنل در دسترس بمونه
+      - name: Keep runner alive (server is running)
         run: |
-          ssh root@${{ secrets.SERVER_TAILSCALE_HOST }} << 'EOF'
-            echo "===== 3x-ui VPN Panel Access ====="
-            
-            if [ -f /etc/x-ui/install-result.env ]; then
-              cat /etc/x-ui/install-result.env
-            else
-              x-ui settings
-            fi
-
-            ACCESS_URL=$(grep "XUI_ACCESS_URL" /etc/x-ui/install-result.env 2>/dev/null | cut -d'=' -f2)
-            if [ -n "$ACCESS_URL" ]; then
-              echo "Panel Access URL: $ACCESS_URL"
-            fi
-
-            echo "===== Service Status ====="
-            systemctl status x-ui --no-pager | head -5
-          EOF
+          MIN="${{ inputs.keep_alive_minutes }}"
+          echo "Keeping the server alive for ${MIN} minutes..."
+          echo "Panel will die when this step ends."
+          for i in $(seq 1 "$MIN"); do
+            echo "[$i/${MIN}] still alive - $(date -u +%H:%M:%S)"
+            sleep 60
+          done
