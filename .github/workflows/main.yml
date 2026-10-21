@@ -1,0 +1,73 @@
+name: Deploy 3x-ui via Tailscale (Auth Key)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_auth_key:
+        description: 'Tailscale Auth Key (tskey-auth-...)'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 1. اتصال به Tailscale با استفاده از Auth Key ورودی
+      # ------------------------------------------------------------
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ github.event.inputs.tailscale_auth_key }}
+
+      # ------------------------------------------------------------
+      # 2. آماده‌سازی SSH برای اتصال به سرور از طریق Tailscale
+      # ------------------------------------------------------------
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_TAILSCALE_HOST }} >> ~/.ssh/known_hosts
+
+      # ------------------------------------------------------------
+      # 3. نصب 3x-ui در حالت غیرتعاملی
+      # ------------------------------------------------------------
+      - name: Install 3x-ui on Ubuntu
+        run: |
+          ssh root@${{ secrets.SERVER_TAILSCALE_HOST }} << 'EOF'
+            export XUI_NONINTERACTIVE=1
+            export XUI_USERNAME=admin
+            export XUI_PASSWORD=ChangeMe123!
+            export XUI_PANEL_PORT=2053
+            export XUI_WEB_BASE_PATH=$(openssl rand -hex 8)
+
+            bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+          EOF
+
+      # ------------------------------------------------------------
+      # 4. چاپ اطلاعات دسترسی به پنل VPN
+      # ------------------------------------------------------------
+      - name: Print panel URL & credentials
+        run: |
+          ssh root@${{ secrets.SERVER_TAILSCALE_HOST }} << 'EOF'
+            echo "===== 3x-ui VPN Panel Access ====="
+            
+            if [ -f /etc/x-ui/install-result.env ]; then
+              cat /etc/x-ui/install-result.env
+            else
+              x-ui settings
+            fi
+
+            ACCESS_URL=$(grep "XUI_ACCESS_URL" /etc/x-ui/install-result.env 2>/dev/null | cut -d'=' -f2)
+            if [ -n "$ACCESS_URL" ]; then
+              echo "Panel Access URL: $ACCESS_URL"
+            fi
+
+            echo "===== Service Status ====="
+            systemctl status x-ui --no-pager | head -5
+          EOF
