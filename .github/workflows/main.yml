@@ -3,9 +3,20 @@ name: Run 3x-ui Panel (GitHub Runner as Server)
 on:
   workflow_dispatch:
     inputs:
-      tailscale_auth_key:
-        description: 'Tailscale Auth Key (tskey-auth-...)'
+      tunnel_type:
+        description: 'How to expose the panel (Choose your tunnel)'
         required: true
+        type: choice
+        default: 'cloudflare'
+        options:
+          - cloudflare
+          - tailscale
+          - bore
+          - all
+
+      tailscale_auth_key:
+        description: 'Tailscale Auth Key (Required only if using tailscale/all)'
+        required: false
         type: string
 
       xui_username:
@@ -32,7 +43,7 @@ on:
         type: string
 
       keep_alive_minutes:
-        description: 'How many minutes to keep the runner (server) alive'
+        description: 'How many minutes to keep the runner alive'
         required: true
         default: '30'
         type: string
@@ -43,22 +54,19 @@ jobs:
     timeout-minutes: 360   # حداکثر ۶ ساعت
 
     steps:
-      # 0) (اختیاری) چک‌اوت — برای اجرای این وورکفلو لازم نیست ولی بی‌ضرره
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) نصب Tailscale و اتصال به Tailnet روی خود Runner
-      - name: Install & Connect Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ inputs.tailscale_auth_key }}
-          tags: tag:ci
+      # ۱) مخفی‌سازی اطلاعات حساس
+      - name: Mask Sensitive Inputs
+        run: |
+          echo "::add-mask::${{ inputs.xui_password }}"
+          if [ -n "${{ inputs.tailscale_auth_key }}" ]; then
+            echo "::add-mask::${{ inputs.tailscale_auth_key }}"
+          fi
 
-      - name: Show Tailscale IP
-        run: echo "Tailscale IP = $(tailscale ip -4)"
-
-      # 2) نصب 3x-ui روی خود Runner (نیاز به sudo)
-      - name: Install 3x-ui on the runner
+      # ۲) نصب 3x-ui روی Runner (قبل از تونل‌ها اجرا میشه)
+      - name: Install 3x-ui
         env:
           XUI_USERNAME: ${{ inputs.xui_username }}
           XUI_PASSWORD: ${{ inputs.xui_password }}
@@ -77,38 +85,86 @@ jobs:
                XUI_WEB_BASE_PATH="$BASEPATH" \
                bash -c "$(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
 
-          # ذخیره base path برای گام بعدی
           echo "BASEPATH=$BASEPATH" >> "$GITHUB_ENV"
 
-      # 3) چاپ لینک پنل روی Tailscale IP خود Runner
-      - name: Print VPN Panel URL
+      # ۳) راه‌اندازی Tailscale (اگر انتخاب شده باشه)
+      - name: Start Tailscale
+        if: inputs.tunnel_type == 'tailscale' || inputs.tunnel_type == 'all'
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ inputs.tailscale_auth_key || secrets.TAILSCALE_AUTH_KEY }}
+          tags: tag:ci
+          
+      - name: Get Tailscale URL
+        if: inputs.tunnel_type == 'tailscale' || inputs.tunnel_type == 'all'
         run: |
           TSIP=$(tailscale ip -4)
-          URL="http://${TSIP}:${{ inputs.xui_panel_port }}/${BASEPATH}"
+          echo "TS_URL=http://${TSIP}:${{ inputs.xui_panel_port }}" >> $GITHUB_ENV
 
+      # ۴) راه‌اندازی Cloudflare Quick Tunnel (trycloudflare)
+      - name: Start Cloudflare Tunnel
+        if: inputs.tunnel_type == 'cloudflare' || inputs.tunnel_type == 'all'
+        run: |
+          curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o cloudflared
+          chmod +x cloudflared
+          # اجرای تونل در پس‌زمینه
+          ./cloudflared tunnel --url http://127.0.0.1:${{ inputs.xui_panel_port }} > cloudflare.log 2>&1 &
+          
+          # صبر برای گرفتن لینک پابلیک
+          echo "Waiting for Cloudflare to assign a URL..."
+          sleep 8
+          CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" cloudflare.log | head -n 1)
+          echo "CF_URL=$CF_URL" >> $GITHUB_ENV
+
+      # ۵) راه‌اندازی Bore Tunnel
+      - name: Start Bore Tunnel
+        if: inputs.tunnel_type == 'bore' || inputs.tunnel_type == 'all'
+        run: |
+          curl -sL "https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz" | tar -xz
+          chmod +x bore
+          # اجرای تونل به سمت سرور عمومی bore.pub در پس‌زمینه
+          ./bore local ${{ inputs.xui_panel_port }} --to bore.pub > bore.log 2>&1 &
+          
+          echo "Waiting for Bore to assign a port..."
+          sleep 4
+          BORE_ADDR=$(grep -oE "bore\.pub:[0-9]+" bore.log | head -n 1)
+          echo "BORE_URL=http://$BORE_ADDR" >> $GITHUB_ENV
+
+      # ۶) چاپ لینک‌های نهایی پنل
+      - name: Print VPN Panel URLs
+        run: |
           echo "============================================="
-          echo "   3x-ui VPN Panel is UP"
+          echo "   3x-ui VPN Panel is UP & TUNNELED"
           echo "============================================="
-          echo "Panel URL  : $URL"
+          
+          if [ -n "$TS_URL" ]; then echo "🟢 Tailscale  : $TS_URL/${BASEPATH}/"; fi
+          if [ -n "$CF_URL" ]; then echo "🟠 Cloudflare : $CF_URL/${BASEPATH}/"; fi
+          if [ -n "$BORE_URL" ]; then echo "🔵 Bore       : $BORE_URL/${BASEPATH}/"; fi
+          
+          echo "============================================="
           echo "Username   : ${{ inputs.xui_username }}"
-          echo "Password   : ${{ inputs.xui_password }}"
-          echo "Tailscale  : $TSIP"
+          echo "Password   : *** [Hidden for security] ***"
           echo "Expires in : ${{ inputs.keep_alive_minutes }} minutes"
           echo "============================================="
 
-          # مخفی‌سازی رمز در لاگ‌های بعدی
-          echo "::add-mask::${{ inputs.xui_password }}"
-
-          # نمایش وضعیت سرویس
-          sudo systemctl status x-ui --no-pager | head -8 || true
-
-      # 4) زنده نگه‌داشتن Runner تا پنل در دسترس بمونه
-      - name: Keep runner alive (server is running)
+      # ۷) زنده نگه‌داشتن سرور
+      - name: Keep runner alive
         run: |
           MIN="${{ inputs.keep_alive_minutes }}"
+          LOOPS=$(( MIN / 5 ))
+          if [ "$LOOPS" -eq 0 ]; then LOOPS=1; SLEEP_TIME=$(( MIN * 60 )); else SLEEP_TIME=300; fi
+
           echo "Keeping the server alive for ${MIN} minutes..."
-          echo "Panel will die when this step ends."
-          for i in $(seq 1 "$MIN"); do
-            echo "[$i/${MIN}] still alive - $(date -u +%H:%M:%S)"
-            sleep 60
+          for i in $(seq 1 "$LOOPS"); do
+            echo "[$i/$LOOPS] Server is running - $(date -u +%H:%M:%S)"
+            sleep $SLEEP_TIME
           done
+
+      # ۸) بک‌آپ دیتابیس
+      - name: Backup 3x-ui Database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xui-database-backup
+          path: /etc/x-ui/x-ui.db
+          retention-days: 5
